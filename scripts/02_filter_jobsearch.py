@@ -46,9 +46,13 @@ def compile_keywords(custom_json: str | None) -> list[str]:
     return DEFAULT_KEYWORDS
 
 
-def keyword_hits(text: str, keywords: list[str]) -> list[str]:
+def compile_keyword_patterns(keywords: list[str]) -> dict[str, re.Pattern[str]]:
+    return {kw: re.compile(rf"\b{re.escape(kw.lower())}\b") for kw in keywords}
+
+
+def keyword_hits(text: str, compiled_keywords: dict[str, re.Pattern[str]]) -> list[str]:
     lowered = text.lower()
-    return [kw for kw in keywords if re.search(rf"\b{re.escape(kw.lower())}\b", lowered)]
+    return [kw for kw, pattern in compiled_keywords.items() if pattern.search(lowered)]
 
 
 def llm_is_jobsearch(model: str, text: str) -> bool:
@@ -76,10 +80,11 @@ def main() -> None:
 
     keywords = compile_keywords(args.keywords_json)
     rows = read_rows(args.input)
+    compiled_keywords = compile_keyword_patterns(keywords)
     filtered: list[dict] = []
 
     for row in rows:
-        hits = keyword_hits(str(row.get("text", "")), keywords)
+        hits = keyword_hits(str(row.get("text", "")), compiled_keywords)
         row["keyword_hits"] = hits
         row["keyword_score"] = len(hits)
         if row["keyword_score"] < args.min_keyword_hits:

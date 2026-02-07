@@ -7,9 +7,10 @@ import logging
 import os
 import re
 from pathlib import Path
+from typing import Any
 
 from pipeline_io import read_rows
-from pipeline_utils import load_json, setup_logging, stable_id
+from pipeline_utils import ensure_parent, load_json, setup_logging, stable_id
 
 
 SCHEMA = {
@@ -80,6 +81,35 @@ def heuristic_extract(text: str, source_ref: dict) -> dict:
     return {"questions": questions, "concerns": concerns, "advice": advice, "workflows": workflows}
 
 
+
+
+def _extract_output_text(response: Any) -> str:
+    text = (getattr(response, "output_text", "") or "").strip()
+    if text:
+        return text
+
+    output = getattr(response, "output", None) or []
+    chunks: list[str] = []
+    for item in output:
+        for content in getattr(item, "content", None) or []:
+            if getattr(content, "type", None) in {"output_text", "text"} and getattr(content, "text", None):
+                chunks.append(content.text)
+    return "\n".join(chunks).strip()
+
+
+def _extract_json_payload(response: Any) -> dict:
+    payload = _extract_output_text(response)
+    if not payload:
+        raise ValueError("empty text payload from model response")
+
+    try:
+        return json.loads(payload)
+    except json.JSONDecodeError:
+        match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", payload, re.DOTALL | re.IGNORECASE)
+        if match:
+            return json.loads(match.group(1))
+        raise
+
 def llm_extract(model: str, text: str, source_ref: dict) -> dict:
     from openai import OpenAI
 
@@ -90,7 +120,7 @@ def llm_extract(model: str, text: str, source_ref: dict) -> dict:
         f"{json.dumps(source_ref)}\nSchema example:\n{json.dumps(SCHEMA)}\nUse empty arrays if none found."
     )
     response = client.responses.create(model=model, input=f"{instruction}\n\nChunk:\n{text[:9000]}")
-    return json.loads(response.output_text.strip())
+    return _extract_json_payload(response)
 
 
 def main() -> None:
@@ -123,6 +153,10 @@ def main() -> None:
                     try:
                         extracted = llm_extract(args.model, str(row.get("text", "")), source_ref)
                     except Exception as exc:  # noqa: BLE001
+                        message = str(exc)
+                        if "insufficient_quota" in message:
+                            logging.warning("OpenAI quota unavailable; switching to heuristic extraction for remaining chunks")
+                            args.rule_based = True
                         logging.warning("LLM extraction failed for %s, using heuristic: %s", row.get("chunk_id"), exc)
                         extracted = heuristic_extract(str(row.get("text", "")), source_ref)
                 cache[key] = extracted
@@ -139,6 +173,7 @@ def main() -> None:
             }
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
+    ensure_parent(cache_path)
     cache_path.write_text(json.dumps(cache, indent=2), encoding="utf-8")
     logging.info("wrote extraction output to %s", output_path)
 
